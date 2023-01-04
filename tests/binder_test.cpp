@@ -16,6 +16,7 @@
  * binder_test.cpp - unit tests for netd binder RPCs.
  */
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
@@ -53,7 +54,7 @@
 #include <android-base/test_utils.h>
 #include <android/multinetwork.h>
 #include <binder/IPCThreadState.h>
-#include <bpf/BpfUtils.h>
+#include <bpf/KernelVersion.h>
 #include <com/android/internal/net/BnOemNetdUnsolicitedEventListener.h>
 #include <com/android/internal/net/IOemNetd.h>
 #include <cutils/multiuser.h>
@@ -121,6 +122,7 @@ using android::net::RULE_PRIORITY_BYPASSABLE_VPN_LOCAL_EXCLUSION;
 using android::net::RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION;
 using android::net::RULE_PRIORITY_DEFAULT_NETWORK;
 using android::net::RULE_PRIORITY_EXPLICIT_NETWORK;
+using android::net::RULE_PRIORITY_LOCAL_NETWORK;
 using android::net::RULE_PRIORITY_LOCAL_ROUTES;
 using android::net::RULE_PRIORITY_OUTPUT_INTERFACE;
 using android::net::RULE_PRIORITY_PROHIBIT_NON_VPN;
@@ -177,6 +179,8 @@ static const std::string ESP_ALLOW_RULE("esp");
 static const in6_addr V6_ADDR = {
         {// 2001:db8:cafe::8888
          .u6_addr8 = {0x20, 0x01, 0x0d, 0xb8, 0xca, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88}}};
+
+typedef enum { ALL_EXIST, NONE_EXIST } ExistMode;
 
 class NetdBinderTest : public NetNativeTestBase {
   public:
@@ -734,6 +738,11 @@ TEST_F(NetdBinderTest, BandwidthEnableDataSaver) {
     }
 }
 
+static bool ipRuleExists(const char* ipVersion, const std::string& ipRule) {
+    std::vector<std::string> rules = listIpRules(ipVersion);
+    return std::find(rules.begin(), rules.end(), ipRule) != rules.end();
+}
+
 static bool ipRuleExistsForRange(const uint32_t priority, const UidRangeParcel& range,
                                  const std::string& action, const char* ipVersion,
                                  const char* oif) {
@@ -745,11 +754,10 @@ static bool ipRuleExistsForRange(const uint32_t priority, const UidRangeParcel& 
     std::string prefix = StringPrintf("%" PRIu32 ":", priority);
     std::string suffix;
     if (oif) {
-        suffix = StringPrintf(" iif lo oif %s uidrange %d-%d %s\n", oif, range.start, range.stop,
+        suffix = StringPrintf(" iif lo oif %s uidrange %d-%d %s", oif, range.start, range.stop,
                               action.c_str());
     } else {
-        suffix = StringPrintf(" iif lo uidrange %d-%d %s\n", range.start, range.stop,
-                              action.c_str());
+        suffix = StringPrintf(" iif lo uidrange %d-%d %s", range.start, range.stop, action.c_str());
     }
     for (const auto& line : rules) {
         if (android::base::StartsWith(line, prefix) && android::base::EndsWith(line, suffix)) {
@@ -771,6 +779,26 @@ static bool ipRuleExistsForRange(const uint32_t priority, const UidRangeParcel& 
 static bool ipRuleExistsForRange(const uint32_t priority, const UidRangeParcel& range,
                                  const std::string& action) {
     return ipRuleExistsForRange(priority, range, action, nullptr);
+}
+
+static void expectRuleForV4AndV6(ExistMode mode, const std::string& rule) {
+    for (const auto& ipVersion : {IP_RULE_V4, IP_RULE_V6}) {
+        if (mode == ALL_EXIST) {
+            EXPECT_TRUE(ipRuleExists(ipVersion, rule));
+        } else {
+            EXPECT_FALSE(ipRuleExists(ipVersion, rule));
+        }
+    }
+}
+
+static void expectLocalIpRuleExists(ExistMode mode, const std::string& ifName) {
+    std::string localIpRule = StringPrintf("%u:\tfrom all fwmark 0x0/0x10000 lookup %s",
+                                           RULE_PRIORITY_LOCAL_NETWORK, ifName.c_str());
+    expectRuleForV4AndV6(mode, localIpRule);
+
+    std::string dnsMasqRule = StringPrintf("%u:\tfrom all fwmark 0x10063/0x1ffff iif lo lookup %s",
+                                           RULE_PRIORITY_EXPLICIT_NETWORK, ifName.c_str());
+    expectRuleForV4AndV6(mode, dnsMasqRule);
 }
 
 namespace {
@@ -832,7 +860,7 @@ TEST_F(NetdBinderTest, NetworkUidRules) {
     std::vector<UidRangeParcel> uidRanges = {makeUidRangeParcel(BASE_UID + 8005, BASE_UID + 8012),
                                              makeUidRangeParcel(BASE_UID + 8090, BASE_UID + 8099)};
     UidRangeParcel otherRange = makeUidRangeParcel(BASE_UID + 8190, BASE_UID + 8299);
-    std::string action = StringPrintf("lookup %s ", sTun.name().c_str());
+    std::string action = StringPrintf("lookup %s", sTun.name().c_str());
 
     EXPECT_TRUE(mNetd->networkAddUidRanges(TEST_NETID1, uidRanges).isOk());
 
@@ -847,6 +875,26 @@ TEST_F(NetdBinderTest, NetworkUidRules) {
     EXPECT_FALSE(ipRuleExistsForRange(RULE_PRIORITY_SECURE_VPN, uidRanges[1], action));
 
     EXPECT_EQ(ENONET, mNetd->networkDestroy(TEST_NETID1).serviceSpecificErrorCode());
+}
+
+class LocalNetworkParameterizedTest : public NetdBinderTest,
+                                      public testing::WithParamInterface<bool> {};
+
+// Exercise both local and non-local networks
+INSTANTIATE_TEST_SUITE_P(LocalNetworkTests, LocalNetworkParameterizedTest, testing::Bool(),
+                         [](const testing::TestParamInfo<bool>& info) {
+                             return info.param ? "Local" : "NonLocal";
+                         });
+
+TEST_P(LocalNetworkParameterizedTest, LocalNetworkUidRules) {
+    const bool local = GetParam();
+    const auto type = local ? NativeNetworkType::PHYSICAL_LOCAL : NativeNetworkType::PHYSICAL;
+    auto config = makeNativeNetworkConfig(TEST_NETID1, type, INetd::PERMISSION_NONE,
+                                          false /* secure */, false /* excludeLocalRoutes */);
+    EXPECT_TRUE(mNetd->networkCreate(config).isOk());
+    EXPECT_TRUE(mNetd->networkAddInterface(TEST_NETID1, sTun.name()).isOk());
+
+    expectLocalIpRuleExists(local ? ALL_EXIST : NONE_EXIST, sTun.name());
 }
 
 TEST_F(NetdBinderTest, NetworkRejectNonSecureVpn) {
@@ -1566,16 +1614,6 @@ void expectStrictSetUidReject(const int uid) {
     }
 }
 
-bool ipRuleExists(const char* ipVersion, const std::string& ipRule) {
-    std::vector<std::string> rules = listIpRules(ipVersion);
-    for (const auto& rule : rules) {
-        if (rule.find(ipRule) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
 std::vector<std::string> ipRouteSubstrings(const std::string& ifName, const std::string& dst,
                                            const std::string& nextHop, const std::string& mtu) {
     std::vector<std::string> routeSubstrings;
@@ -1637,9 +1675,7 @@ void expectNetworkDefaultIpRuleExists(const char* ifName) {
             StringPrintf("%u:\tfrom all fwmark 0x0/0xffff iif lo lookup %s",
                          RULE_PRIORITY_DEFAULT_NETWORK, ifName);
 
-    for (const auto& ipVersion : {IP_RULE_V4, IP_RULE_V6}) {
-        EXPECT_TRUE(ipRuleExists(ipVersion, networkDefaultRule));
-    }
+    expectRuleForV4AndV6(ALL_EXIST, networkDefaultRule);
 }
 
 void expectNetworkDefaultIpRuleDoesNotExist() {
@@ -1647,7 +1683,12 @@ void expectNetworkDefaultIpRuleDoesNotExist() {
             StringPrintf("%u:\tfrom all fwmark 0x0/0xffff iif lo", RULE_PRIORITY_DEFAULT_NETWORK);
 
     for (const auto& ipVersion : {IP_RULE_V4, IP_RULE_V6}) {
-        EXPECT_FALSE(ipRuleExists(ipVersion, networkDefaultRule));
+        std::vector<std::string> rules = listIpRules(ipVersion);
+        for (const auto& line : rules) {
+            if (android::base::StartsWith(line, networkDefaultRule)) {
+                FAIL();
+            }
+        }
     }
 }
 
@@ -1671,9 +1712,7 @@ void expectNetworkPermissionIpRuleExists(const char* ifName, int permission) {
             break;
     }
 
-    for (const auto& ipVersion : {IP_RULE_V4, IP_RULE_V6}) {
-        EXPECT_TRUE(ipRuleExists(ipVersion, networkPermissionRule));
-    }
+    expectRuleForV4AndV6(ALL_EXIST, networkPermissionRule);
 }
 
 // TODO: It is a duplicate function, need to remove it
@@ -1943,7 +1982,7 @@ bool ipRuleIpfwdExists(const char* ipVersion, const std::string& ipfwdRule) {
 
 void expectIpfwdRuleExists(const char* fromIf, const char* toIf) {
     std::string ipfwdRule =
-            StringPrintf("%u:\tfrom all iif %s lookup %s ", RULE_PRIORITY_TETHERING, fromIf, toIf);
+            StringPrintf("%u:\tfrom all iif %s lookup %s", RULE_PRIORITY_TETHERING, fromIf, toIf);
 
     for (const auto& ipVersion : {IP_RULE_V4, IP_RULE_V6}) {
         EXPECT_TRUE(ipRuleIpfwdExists(ipVersion, ipfwdRule));
@@ -1952,7 +1991,7 @@ void expectIpfwdRuleExists(const char* fromIf, const char* toIf) {
 
 void expectIpfwdRuleNotExists(const char* fromIf, const char* toIf) {
     std::string ipfwdRule =
-            StringPrintf("%u:\tfrom all iif %s lookup %s ", RULE_PRIORITY_TETHERING, fromIf, toIf);
+            StringPrintf("%u:\tfrom all iif %s lookup %s", RULE_PRIORITY_TETHERING, fromIf, toIf);
 
     for (const auto& ipVersion : {IP_RULE_V4, IP_RULE_V6}) {
         EXPECT_FALSE(ipRuleIpfwdExists(ipVersion, ipfwdRule));
@@ -4035,12 +4074,16 @@ namespace {
 #define APP_DEFAULT_NETID TEST_NETID2
 #define VPN_NETID TEST_NETID3
 
+#define ENTERPRISE_NETID_1 TEST_NETID2
+#define ENTERPRISE_NETID_2 TEST_NETID3
+#define ENTERPRISE_NETID_3 TEST_NETID4
+
 void verifyAppUidRules(std::vector<bool>&& expectedResults, std::vector<UidRangeParcel>& uidRanges,
                        const std::string& iface, int32_t subPriority) {
     ASSERT_EQ(expectedResults.size(), uidRanges.size());
     if (iface.size()) {
-        std::string action = StringPrintf("lookup %s ", iface.c_str());
-        std::string action_local = StringPrintf("lookup %s_local ", iface.c_str());
+        std::string action = StringPrintf("lookup %s", iface.c_str());
+        std::string action_local = StringPrintf("lookup %s_local", iface.c_str());
         for (unsigned long i = 0; i < uidRanges.size(); i++) {
             EXPECT_EQ(expectedResults[i],
                       ipRuleExistsForRange(RULE_PRIORITY_UID_EXPLICIT_NETWORK + subPriority,
@@ -4079,7 +4122,7 @@ void verifyAppUidRules(std::vector<bool>&& expectedResults, NativeUidRangeConfig
 void verifyVpnUidRules(std::vector<bool>&& expectedResults, NativeUidRangeConfig& uidRangeConfig,
                        const std::string& iface, bool secure, bool excludeLocalRoutes) {
     ASSERT_EQ(expectedResults.size(), uidRangeConfig.uidRanges.size());
-    std::string action = StringPrintf("lookup %s ", iface.c_str());
+    std::string action = StringPrintf("lookup %s", iface.c_str());
 
     int32_t priority;
     if (secure) {
@@ -5388,4 +5431,128 @@ TEST_F(MDnsBinderTest, EventListenerTest) {
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
     status = mMDns->unregisterEventListener(testListener);
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+}
+
+// Creates a system default network and 3 enterprise networks for two profiles. Check if network
+// selection in compliance with network allow list settings.
+//
+// +-----------+-----------------------+----------------------------------------+
+// |    UID    | UID's default network | UID can select networks                |
+// +-----------+-----------------------+----------------------------------------+
+// | TEST_UID1 | ENTERPRISE_NETID_1    | ENTERPRISE_NETID_1, ENTERPRISE_NETID_2 |
+// | TEST_UID2 | ENTERPRISE_NETID_3    | ENTERPRISE_NETID_3                     |
+// +-----------+-----------------------+----------------------------------------+
+TEST_F(NetdBinderTest, PerProfileNetworkPermission) {
+    // creates 4 networks
+    createDefaultAndOtherPhysicalNetwork(SYSTEM_DEFAULT_NETID, ENTERPRISE_NETID_1);
+    createPhysicalNetwork(ENTERPRISE_NETID_2, sTun3.name());
+    EXPECT_TRUE(mNetd->networkAddRoute(ENTERPRISE_NETID_2, sTun3.name(), "::/0", "").isOk());
+    createPhysicalNetwork(ENTERPRISE_NETID_3, sTun4.name());
+    EXPECT_TRUE(mNetd->networkAddRoute(ENTERPRISE_NETID_3, sTun4.name(), "::/0", "").isOk());
+
+    // profile#1
+    NativeUidRangeConfig cfg1 =
+            makeNativeUidRangeConfig(ENTERPRISE_NETID_1, {makeUidRangeParcel(TEST_UID1, TEST_UID1)},
+                                     UidRanges::SUB_PRIORITY_HIGHEST + 20);
+    EXPECT_TRUE(mNetd->networkAddUidRangesParcel(cfg1).isOk());
+
+    // profile#2
+    NativeUidRangeConfig cfg2 =
+            makeNativeUidRangeConfig(ENTERPRISE_NETID_3, {makeUidRangeParcel(TEST_UID2, TEST_UID2)},
+                                     UidRanges::SUB_PRIORITY_HIGHEST + 20);
+    EXPECT_TRUE(mNetd->networkAddUidRangesParcel(cfg2).isOk());
+
+    // setNetworkAllowlist at once
+    // all uids except for TEST_UID2
+    NativeUidRangeConfig nw1UserConfig = makeNativeUidRangeConfig(
+            ENTERPRISE_NETID_1,
+            {makeUidRangeParcel(0, TEST_UID3), makeUidRangeParcel(TEST_UID1, TEST_UID1)},
+            /*unused*/ 0);
+    NativeUidRangeConfig nw2UserConfig = makeNativeUidRangeConfig(
+            ENTERPRISE_NETID_2,
+            {makeUidRangeParcel(0, TEST_UID3), makeUidRangeParcel(TEST_UID1, TEST_UID1)},
+            /*unused*/ 0);
+    // all uids except for TEST_UID1
+    NativeUidRangeConfig nw3UserConfig = makeNativeUidRangeConfig(
+            ENTERPRISE_NETID_3, {makeUidRangeParcel(0, TEST_UID2)}, /*unused*/ 0);
+    // all uids except for TEST_UID1 and TEST_UID2
+    NativeUidRangeConfig nwDefaultUserConfig = makeNativeUidRangeConfig(
+            SYSTEM_DEFAULT_NETID, {makeUidRangeParcel(0, TEST_UID3)}, /*unused*/ 0);
+    EXPECT_TRUE(mNetd->setNetworkAllowlist(
+                             {nw1UserConfig, nw2UserConfig, nw3UserConfig, nwDefaultUserConfig})
+                        .isOk());
+
+    {  // Can set network for process on allowed networks.
+        ScopedUidChange scopedUidChange(TEST_UID1);
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_1));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_2));
+        // Can not set network for process on not allowed networks.
+        EXPECT_EQ(-EACCES, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(ENTERPRISE_NETID_3));
+    }
+    {  // Can set network for process on allowed networks.
+        ScopedUidChange scopedUidChange(TEST_UID2);
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_3));
+        // Can not set network for process on not allowed networks.
+        EXPECT_EQ(-EACCES, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(ENTERPRISE_NETID_1));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(ENTERPRISE_NETID_2));
+    }
+    {  // Root can use whatever network it wants.
+        ScopedUidChange scopedUidChange(AID_ROOT);
+        EXPECT_EQ(0, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_1));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_2));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_3));
+    }
+
+    // Update setting: remove ENTERPRISE_NETID_2 from profile#1's allowed network list and add it to
+    // profile#2's allowed network list.
+    // +-----------+-----------------------+----------------------------------------+
+    // |    UID    | UID's default network | UID can select networks                |
+    // +-----------+-----------------------+----------------------------------------+
+    // | TEST_UID1 | ENTERPRISE_NETID_1    | ENTERPRISE_NETID_1                     |
+    // | TEST_UID2 | ENTERPRISE_NETID_3    | ENTERPRISE_NETID_2, ENTERPRISE_NETID_3 |
+    // +-----------+-----------------------+----------------------------------------+
+
+    // all uids except for TEST_UID2
+    nw1UserConfig = makeNativeUidRangeConfig(
+            ENTERPRISE_NETID_1,
+            {makeUidRangeParcel(0, TEST_UID3), makeUidRangeParcel(TEST_UID1, TEST_UID1)},
+            /*unused*/ 0);
+    // all uids except for TEST_UID1
+    nw2UserConfig = makeNativeUidRangeConfig(ENTERPRISE_NETID_2, {makeUidRangeParcel(0, TEST_UID2)},
+                                             /*unused*/ 0);
+    nw3UserConfig = makeNativeUidRangeConfig(ENTERPRISE_NETID_3, {makeUidRangeParcel(0, TEST_UID2)},
+                                             /*unused*/ 0);
+    // all uids except for TEST_UID1 and TEST_UID2
+    nwDefaultUserConfig = makeNativeUidRangeConfig(
+            SYSTEM_DEFAULT_NETID, {makeUidRangeParcel(0, TEST_UID3)}, /*unused*/ 0);
+    EXPECT_TRUE(mNetd->setNetworkAllowlist(
+                             {nw1UserConfig, nw2UserConfig, nw3UserConfig, nwDefaultUserConfig})
+                        .isOk());
+
+    {
+        ScopedUidChange scopedUidChange(TEST_UID1);
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_1));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(ENTERPRISE_NETID_2));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(ENTERPRISE_NETID_3));
+    }
+    {
+        ScopedUidChange scopedUidChange(TEST_UID2);
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_2));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_3));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
+        EXPECT_EQ(-EACCES, setNetworkForProcess(ENTERPRISE_NETID_1));
+    }
+
+    // UID not restricted by allowed list can select all networks.
+    {
+        ScopedUidChange scopedUidChange(TEST_UID3);
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_1));
+        EXPECT_EQ(0, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_2));
+        EXPECT_EQ(0, setNetworkForProcess(ENTERPRISE_NETID_3));
+    }
 }
