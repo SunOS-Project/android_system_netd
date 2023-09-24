@@ -90,7 +90,8 @@ static bool propertyValueIsTrue(const char* prop_name) {
     return false;
 }
 
-static bool redirectSocketCallsIsTrue() {
+// whether to hook sendmmsg/sendmsg/sendto
+static bool redirectSendX() {
     static bool cached_result = propertyValueIsTrue(PROPERTY_REDIRECT_SOCKET_CALLS);
     return cached_result;
 }
@@ -146,15 +147,43 @@ int netdClientAccept4(int sockfd, sockaddr* addr, socklen_t* addrlen, int flags)
     return acceptedSocket;
 }
 
+static int getFwMarkServerVersion() {
+    static int version = -1;
+
+    if (version >= 0) return version;
+
+    const auto socketFunc = libcSocket ? libcSocket : socket;
+    unique_fd sockfd(socketFunc(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    if (sockfd < 0) return CURRENT_FWMARK_SERVER_VERSION;  // should not happen
+
+    FwmarkCommand command = {FwmarkCommand::GET_FWMARK_SERVER_VERSION, 0, 0, 0};
+    int retval = FwmarkClient().send(&command, sockfd.get(), nullptr);
+
+    if (retval == -EPROTO) {
+        version = 0;  // old netd complains it doesn't recognize the command
+    } else if (retval >= 0) {
+        version = retval;  // new netd returns version
+    } else {
+        return CURRENT_FWMARK_SERVER_VERSION; // should not happen
+    }
+
+    return version;
+}
+
 int netdClientConnect(int sockfd, const sockaddr* addr, socklen_t addrlen) {
     const bool shouldSetFwmark = shouldMarkSocket(sockfd, addr);
     if (shouldSetFwmark) {
-        FwmarkCommand command = {FwmarkCommand::ON_CONNECT, 0, 0, 0};
+        FwmarkConnectInfo connectInfo(0, 0, addr);
         int error;
-        if (redirectSocketCallsIsTrue()) {
-            FwmarkConnectInfo connectInfo(0, 0, addr);
+
+        if (getFwMarkServerVersion() >= 1) {
+            FwmarkCommand command = {FwmarkCommand::ON_CONNECT_WITH_DADDR, 0, 0, 0};
+            error = FwmarkClient().send(&command, sockfd, &connectInfo);
+        } else if (redirectSendX()) {
+            FwmarkCommand command = {FwmarkCommand::ON_CONNECT, 0, 0, 0};
             error = FwmarkClient().send(&command, sockfd, &connectInfo);
         } else {
+            FwmarkCommand command = {FwmarkCommand::ON_CONNECT, 0, 0, 0};
             error = FwmarkClient().send(&command, sockfd, nullptr);
         }
 
@@ -424,24 +453,15 @@ extern "C" void netdClientInitSocket(SocketFunctionType* function) {
 }
 
 extern "C" void netdClientInitSendmmsg(SendmmsgFunctionType* function) {
-    if (!propertyValueIsTrue(PROPERTY_REDIRECT_SOCKET_CALLS)) {
-        return;
-    }
-    HOOK_ON_FUNC(function, libcSendmmsg, netdClientSendmmsg);
+    if (redirectSendX()) HOOK_ON_FUNC(function, libcSendmmsg, netdClientSendmmsg);
 }
 
 extern "C" void netdClientInitSendmsg(SendmsgFunctionType* function) {
-    if (!propertyValueIsTrue(PROPERTY_REDIRECT_SOCKET_CALLS)) {
-        return;
-    }
-    HOOK_ON_FUNC(function, libcSendmsg, netdClientSendmsg);
+    if (redirectSendX()) HOOK_ON_FUNC(function, libcSendmsg, netdClientSendmsg);
 }
 
 extern "C" void netdClientInitSendto(SendtoFunctionType* function) {
-    if (!propertyValueIsTrue(PROPERTY_REDIRECT_SOCKET_CALLS)) {
-        return;
-    }
-    HOOK_ON_FUNC(function, libcSendto, netdClientSendto);
+    if (redirectSendX()) HOOK_ON_FUNC(function, libcSendto, netdClientSendto);
 }
 
 extern "C" void netdClientInitNetIdForResolv(NetIdForResolvFunctionType* function) {

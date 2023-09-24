@@ -29,7 +29,7 @@ struct FwmarkConnectInfo {
         sockaddr s;
         sockaddr_in sin;
         sockaddr_in6 sin6;
-    } addr;
+    } addr = {};
 
     FwmarkConnectInfo() : error(0), latencyMs(0) {}
 
@@ -56,7 +56,7 @@ struct FwmarkConnectInfo {
 struct FwmarkCommand {
     enum CmdId {
         ON_ACCEPT,
-        ON_CONNECT,
+        ON_CONNECT,              // deprecated in favour of ON_CONNECT_WITH_DADDR
         SELECT_NETWORK,
         PROTECT_FROM_VPN,
         SELECT_FOR_USER,
@@ -69,6 +69,9 @@ struct FwmarkCommand {
         ON_SENDMMSG,
         ON_SENDMSG,
         ON_SENDTO,
+        ON_CONNECT_WITH_DADDR,   // supported starting with just before FwMarkServer v1
+        GET_FWMARK_SERVER_VERSION,  // returns version, but version 0 returns -EPROTO
+#define CURRENT_FWMARK_SERVER_VERSION 1
     } cmdId;
     unsigned netId;  // used only in the SELECT_NETWORK command; ignored otherwise.
     uid_t uid;       // used in the SELECT_FOR_USER, QUERY_USER_ACCESS, TAG_SOCKET,
