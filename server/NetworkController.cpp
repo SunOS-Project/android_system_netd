@@ -373,6 +373,19 @@ unsigned NetworkController::getNetworkForInterface(const char* interface) const 
     return getNetworkForInterfaceLocked(interface);
 }
 
+unsigned NetworkController::getNetworkForInterfaceLocked(const int ifIndex) const {
+    char interfaceName[IFNAMSIZ] = {};
+    if (if_indextoname(ifIndex, interfaceName)) {
+        return getNetworkForInterfaceLocked(interfaceName);
+    }
+    return NETID_UNSET;
+}
+
+unsigned NetworkController::getNetworkForInterface(const int ifIndex) const {
+    ScopedRLock lock(mRWLock);
+    return getNetworkForInterfaceLocked(ifIndex);
+}
+
 bool NetworkController::isVirtualNetwork(unsigned netId) const {
     ScopedRLock lock(mRWLock);
     return isVirtualNetworkLocked(netId);
@@ -714,16 +727,14 @@ bool NetworkController::canProtect(uid_t uid) const {
     return canProtectLocked(uid);
 }
 
-void NetworkController::allowProtect(const std::vector<uid_t>& uids) {
+void NetworkController::allowProtect(uid_t uid) {
     ScopedWLock lock(mRWLock);
-    mProtectableUsers.insert(uids.begin(), uids.end());
+    mProtectableUsers.insert(uid);
 }
 
-void NetworkController::denyProtect(const std::vector<uid_t>& uids) {
+void NetworkController::denyProtect(uid_t uid) {
     ScopedWLock lock(mRWLock);
-    for (uid_t uid : uids) {
-        mProtectableUsers.erase(uid);
-    }
+    mProtectableUsers.erase(uid);
 }
 
 void NetworkController::dump(DumpWriter& dw) {
