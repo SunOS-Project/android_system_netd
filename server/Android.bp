@@ -92,7 +92,6 @@ cc_defaults {
         "netd_defaults",
     ],
     include_dirs: [
-        "external/mdnsresponder/mDNSShared",
         "system/netd/include",
     ],
     shared_libs: [
@@ -106,7 +105,6 @@ cc_defaults {
         "libdl",
         "libhidlbase",
         "liblog",
-        "libmdnssd",
         "libnetd_updatable",
         "libnetd_resolv",
         "libnetdutils",
@@ -130,8 +128,6 @@ cc_defaults {
         "EventReporter.cpp",
         "FwmarkServer.cpp",
         "LocalNetwork.cpp",
-        "MDnsEventReporter.cpp",
-        "MDnsSdListener.cpp",
         "MDnsService.cpp",
         "NetdCommand.cpp",
         "NetdHwAidlService.cpp",
@@ -279,22 +275,6 @@ cc_defaults {
             "cken@google.com",
         ],
         triage_assignee: "waghpawan@google.com",
-    }
-}
-
-cc_fuzz {
-    name: "mdns_service_fuzzer",
-    defaults: [
-        "service_fuzzer_defaults",
-        "netd_aidl_fuzzer_defaults",
-    ],
-    srcs: [
-        "aidl-fuzzers/MDnsServiceFuzzer.cpp",
-    ],
-    fuzz_config: {
-        cc: [
-            "paulhu@google.com",
-        ],
     }
 }
 
