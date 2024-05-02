@@ -279,18 +279,12 @@ int BandwidthController::enableBandwidthControl() {
     mSharedQuotaIfaces.clear();
     mQuotaIfaces.clear();
     mGlobalAlertBytes = 0;
-    mSharedQuotaBytes = mSharedAlertBytes = 0;
+    mSharedQuotaBytes = 0;
 
     flushCleanTables(false);
 
     std::string commands = Join(getBasicAccountingCommands(), '\n');
     return iptablesRestoreFunction(V4V6, commands, nullptr);
-}
-
-int BandwidthController::disableBandwidthControl() {
-
-    flushCleanTables(false);
-    return 0;
 }
 
 std::string BandwidthController::makeDataSaverCommand(IptablesTarget target, bool enable) {
@@ -408,12 +402,6 @@ int BandwidthController::removeInterfaceSharedQuota(const std::string& iface) {
     mSharedQuotaIfaces.erase(it);
     if (mSharedQuotaIfaces.empty()) {
         mSharedQuotaBytes = 0;
-        if (mSharedAlertBytes) {
-            res = removeSharedAlert();
-            if (res == 0) {
-                mSharedAlertBytes = 0;
-            }
-        }
     }
 
     return res;
@@ -600,22 +588,6 @@ int BandwidthController::removeGlobalAlert() {
     res = runIptablesAlertCmd(IptOpDelete, alertName, mGlobalAlertBytes);
     mGlobalAlertBytes = 0;
     return res;
-}
-
-int BandwidthController::setSharedAlert(int64_t bytes) {
-    if (!mSharedQuotaBytes) {
-        ALOGE("Need to have a prior shared quota set to set an alert");
-        return -1;
-    }
-    if (!bytes) {
-        ALOGE("Invalid bytes value. 1..max_int64.");
-        return -1;
-    }
-    return setCostlyAlert("shared", bytes, &mSharedAlertBytes);
-}
-
-int BandwidthController::removeSharedAlert() {
-    return removeCostlyAlert("shared", &mSharedAlertBytes);
 }
 
 int BandwidthController::setInterfaceAlert(const std::string& iface, int64_t bytes) {
